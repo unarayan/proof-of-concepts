@@ -1,0 +1,56 @@
+server:
+  host: "0.0.0.0"
+  port: 8020
+
+api:
+  cors_allow_origins:
+    - "http://127.0.0.1"
+    - "http://localhost"
+  openai_model_name: "smart-kiosk-rag"
+
+models:
+  llm:
+    hf_id: "Qwen/Qwen2.5-3B-Instruct"
+    device: "GPU"
+    weight_format: "int8"
+    models_base_path: "./models/llm"
+    hf_token: null
+    model_path: null
+    use_local_cache: true
+    temperature: 0.0
+  embedding:
+    provider: "sentence_transformers"
+    hf_id: "BAAI/bge-large-en-v1.5"
+    device: "CPU"
+    models_base_path: "./models/embeddings"
+    weight_format: "fp16"
+    use_local_cache: true
+    normalize_embeddings: true
+
+storage:
+  persist_directory: "./storage/vector_db"
+  collection_name: "smart-kiosk-assistant-bge-large"
+
+retrieval:
+  top_k: 3
+  fetch_k: 6
+  max_context_chars: 16000
+  score_threshold: null
+
+chunking:
+  strategy: "semantic_llm"
+  max_chunk_chars: 3200
+  min_chunk_chars: 320
+  overlap_chars: 320
+  semantic_similarity_threshold: 0.72
+  llm_passage_chars: 8000
+  llm_passage_tokens: 8000
+  llm_passage_overlap_tokens: 400
+
+answering:
+  system_prompt: |
+    You are Smart Kiosk Assistant for a retail store.
+    Use the retrieved context first. Answer clearly, directly, and in a way that can be spoken aloud.
+    If the context is insufficient, say what you do know and avoid inventing store-specific facts.
+  fallback_to_general_knowledge: true
+  include_source_markers: false
