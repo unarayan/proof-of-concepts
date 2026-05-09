@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from api.custom_endpoints import router as custom_router
 from api.openai_endpoints import router as openai_router
+from pipeline import close_shared_pipeline
 from utils.config_loader import config
 from utils.ensure_model import ensure_model
 from utils.logger_config import setup_logger
@@ -21,7 +22,10 @@ async def lifespan(app: FastAPI):
     ensure_model()
     preload_models()
     logger.info("smart-kiosk-assistant rag-service initialized")
-    yield
+    try:
+        yield
+    finally:
+        close_shared_pipeline()
 
 
 app = FastAPI(title="smart-kiosk-assistant-rag-service", lifespan=lifespan)

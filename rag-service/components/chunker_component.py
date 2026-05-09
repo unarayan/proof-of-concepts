@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Callable
 
@@ -45,6 +46,13 @@ class SemanticChunker:
         if not normalized:
             return []
 
+        t0 = time.monotonic()
+        logger.info(
+            "[CHUNKER] Starting chunking | strategy=%s | input_chars=%d",
+            self.strategy,
+            len(normalized),
+        )
+
         if self.strategy == "semantic_llm":
             chunks = self._semantic_llm_chunks(normalized)
         elif self.strategy == "semantic_embedding":
@@ -53,7 +61,18 @@ class SemanticChunker:
             chunks = self._recursive_chunks(normalized)
 
         chunks = self._apply_overlap(chunks)
-        return [ChunkRecord(text=chunk, index=index) for index, chunk in enumerate(chunks)]
+        records = [ChunkRecord(text=chunk, index=index) for index, chunk in enumerate(chunks)]
+        elapsed = time.monotonic() - t0
+        logger.info(
+            "[CHUNKER] Done | total_chunks=%d | elapsed=%.1fs",
+            len(records),
+            elapsed,
+        )
+        return records
+
+    # Hard token cap for the chunking LLM call — prevents it from running forever.
+    # Chunking only needs a JSON array back, not a long essay.
+    _CHUNKING_MAX_TOKENS = 1024
 
     def _semantic_llm_chunks(self, text: str) -> list[str]:
         if self.llm_tokenizer is not None and self.llm_passage_tokens > 0:
@@ -64,11 +83,26 @@ class SemanticChunker:
             )
         else:
             coarse_passages = self._split_by_size(text, self.llm_passage_chars)
+
+        total_passages = len(coarse_passages)
+        logger.info("[CHUNKER] semantic_llm | total_passages=%d to process", total_passages)
+
         results: list[str] = []
-        for passage in coarse_passages:
+        for p_idx, passage in enumerate(coarse_passages, start=1):
+            passage_chars = len(passage)
             if len(passage) <= self.max_chunk_chars:
+                logger.info(
+                    "[CHUNKER] Passage %d/%d | chars=%d | fits in one chunk, skipping LLM",
+                    p_idx, total_passages, passage_chars,
+                )
                 results.append(passage)
                 continue
+
+            logger.info(
+                "[CHUNKER] Passage %d/%d | chars=%d | sending to LLM for semantic split",
+                p_idx, total_passages, passage_chars,
+            )
+            t_passage = time.monotonic()
 
             prompt = (
                 "You are preparing chunks for a retail knowledge-base RAG system.\n"
@@ -77,23 +111,42 @@ class SemanticChunker:
                 "- Keep the original wording exactly.\n"
                 "- Split only on natural sentence boundaries.\n"
                 f"- Each chunk should be roughly {self.min_chunk_chars}-{self.max_chunk_chars} characters.\n"
-                "- Return only a JSON array of strings.\n\n"
+                "- Return ONLY a JSON array of strings, nothing else.\n\n"
                 f"PASSAGE:\n{passage}"
             )
             try:
+                # Always cap chunking generation — we only need a JSON array back
                 raw = self.llm_text_generator(
                     prompt,
-                    getattr(config.models.llm, "semantic_chunking_max_new_tokens", None),
+                    self._CHUNKING_MAX_TOKENS,
                     0.0,
                 )
                 parsed = self._parse_llm_chunk_output(raw)
+                elapsed_p = time.monotonic() - t_passage
                 if parsed:
+                    logger.info(
+                        "[CHUNKER] Passage %d/%d | LLM produced %d sub-chunks | %.1fs",
+                        p_idx, total_passages, len(parsed), elapsed_p,
+                    )
                     results.extend(parsed)
                     continue
+                logger.warning(
+                    "[CHUNKER] Passage %d/%d | LLM output unparseable after %.1fs, using embedding fallback",
+                    p_idx, total_passages, elapsed_p,
+                )
             except Exception as exc:  # noqa: BLE001
-                logger.warning("LLM chunking fallback triggered: %s", exc)
+                elapsed_p = time.monotonic() - t_passage
+                logger.warning(
+                    "[CHUNKER] Passage %d/%d | LLM error after %.1fs (%s), using embedding fallback",
+                    p_idx, total_passages, elapsed_p, exc,
+                )
 
-            results.extend(self._semantic_embedding_chunks(passage))
+            fb_chunks = self._semantic_embedding_chunks(passage)
+            logger.info(
+                "[CHUNKER] Passage %d/%d | embedding fallback produced %d chunks",
+                p_idx, total_passages, len(fb_chunks),
+            )
+            results.extend(fb_chunks)
 
         return self._cleanup_chunks(results)
 

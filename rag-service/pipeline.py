@@ -1,26 +1,88 @@
 from __future__ import annotations
 
-import json
+import gc
 import logging
+import queue
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Generator
 
-import torch
+import openvino_genai as ov_genai
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
-from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+from transformers import AutoTokenizer
 
 from components.chunker_component import SemanticChunker
 from components.embedding_component import EmbeddingComponent
 from utils.config_loader import config
-from utils.ensure_model import ensure_llm_model
+from utils.ensure_model import ensure_llm_model, get_llm_model_path
 
 
 logger = logging.getLogger(__name__)
 
 _SHARED_PIPELINE: "RagPipeline | None" = None
+
+
+# ---------------------------------------------------------------------------
+# Streaming helper — matches the smart-classroom ov_genai_util pattern exactly,
+# using put() which is the correct openvino_genai.StreamerBase interface.
+# ---------------------------------------------------------------------------
+class YieldingTextStreamer(ov_genai.StreamerBase):
+    def __init__(self, tokenizer, skip_special_tokens: bool = True) -> None:
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.skip_special_tokens = skip_special_tokens
+        self._queue: queue.Queue[str | None] = queue.Queue()
+        self._token_cache: list[int] = []
+        self._print_len = 0
+
+    def put(self, token_id: int) -> bool:
+        self._token_cache.append(token_id)
+        text = self.tokenizer.decode(self._token_cache, skip_special_tokens=self.skip_special_tokens)
+        new_text = text[self._print_len:]
+        if not new_text:
+            return False
+        if self._is_safe_to_emit(new_text):
+            self._queue.put(new_text)
+            self._print_len = len(text)
+        else:
+            last_token_text = self.tokenizer.decode([token_id], skip_special_tokens=True)
+            if last_token_text.startswith(" "):
+                prev_chunk = text[self._print_len: len(text) - len(last_token_text)]
+                if prev_chunk:
+                    self._queue.put(prev_chunk)
+                    self._print_len += len(prev_chunk)
+        return False
+
+    def end(self) -> None:
+        if self._token_cache:
+            text = self.tokenizer.decode(self._token_cache, skip_special_tokens=self.skip_special_tokens)
+            remaining = text[self._print_len:]
+            if remaining:
+                self._queue.put(remaining)
+        self._queue.put(None)
+        self._token_cache.clear()
+        self._print_len = 0
+
+    def __iter__(self):
+        while True:
+            token = self._queue.get()
+            if token is None:
+                break
+            yield token
+
+    @staticmethod
+    def _is_safe_to_emit(text: str) -> bool:
+        last = text[-1]
+        cp = ord(last)
+        return (
+            last.isspace()
+            or last == "\n"
+            or last in {".", ",", "!", "?", ";", ":"}
+            or 0x4E00 <= cp <= 0x9FFF  # CJK
+        )
 
 
 class ChromaEmbeddingAdapter:
@@ -44,6 +106,7 @@ class RetrievalRecord:
 
 class RagPipeline:
     def __init__(self) -> None:
+        # Ensure model is exported to OpenVINO IR before anything else
         ensure_llm_model()
 
         self.embedding_component = EmbeddingComponent()
@@ -51,9 +114,9 @@ class RagPipeline:
         storage_cfg = config.storage
         self.persist_directory = storage_cfg.persist_directory
         self.collection_name = storage_cfg.collection_name
-        self.top_k = int(getattr(config.retrieval, "top_k", 5))
-        self.fetch_k = int(getattr(config.retrieval, "fetch_k", 10))
-        self.max_context_chars = int(getattr(config.retrieval, "max_context_chars", 12000))
+        self.top_k = int(getattr(config.retrieval, "top_k", 3))
+        self.fetch_k = int(getattr(config.retrieval, "fetch_k", 6))
+        self.max_context_chars = int(getattr(config.retrieval, "max_context_chars", 16000))
         self.score_threshold = getattr(config.retrieval, "score_threshold", None)
         self.include_source_markers = bool(getattr(config.answering, "include_source_markers", False))
 
@@ -64,40 +127,66 @@ class RagPipeline:
         )
 
         llm_cfg = config.models.llm
-        logger.info("Loading PyTorch LLM: %s", llm_cfg.hf_id)
+        self._model_path = get_llm_model_path()
+        self._device = str(getattr(llm_cfg, "device", "CPU")).upper()
+        self._temperature = float(getattr(llm_cfg, "temperature", 0.0))
 
-        configured_device = str(getattr(llm_cfg, "device", "auto")).strip().lower()
-        if configured_device in {"gpu", "cuda"}:
-            if torch.cuda.is_available():
-                device = "cuda"
-            else:
-                logger.warning("GPU requested for LLM but CUDA is unavailable; falling back to CPU")
-                device = "cpu"
-        elif configured_device == "cpu":
-            device = "cpu"
-        else:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        logger.info("Using device: %s", device)
-
-        # Load tokenizer and model
-        self._tokenizer = AutoTokenizer.from_pretrained(llm_cfg.hf_id)
-        self._model = AutoModelForCausalLM.from_pretrained(
-            llm_cfg.hf_id,
-            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+        # Tokenizer is loaded once at startup for the streamer decoder.
+        # The ov_genai.LLMPipeline itself is loaded per-call and destroyed after
+        # each use to free GPU memory (mirrors smart-classroom pattern).
+        logger.info(
+            "Loading HF tokenizer for %s (model path: %s, device: %s)",
+            llm_cfg.hf_id, self._model_path, self._device,
         )
-        self._model.to(device)
-        self._device = device
+        try:
+            self._tokenizer = AutoTokenizer.from_pretrained(self._model_path, fix_mistral_regex=True)
+        except TypeError:
+            self._tokenizer = AutoTokenizer.from_pretrained(self._model_path)
+        self._llm_lock = threading.RLock()
+        self._llm = self._load_llm()
 
+        # Build the chunker — passes _generate_text so semantic LLM chunking also
+        # uses the OpenVINO GenAI path.
         self.chunker = SemanticChunker(
             self.embedding_component,
             self._generate_text,
             llm_tokenizer=self._tokenizer,
         )
 
+    # ------------------------------------------------------------------
+    # Internal: load / destroy LLM pipeline per call (GPU memory safety)
+    # ------------------------------------------------------------------
+    def _load_llm(self) -> ov_genai.LLMPipeline:
+        logger.info("[LLM] Loading ov_genai.LLMPipeline from %s on %s", self._model_path, self._device)
+        return ov_genai.LLMPipeline(self._model_path, self._device)
+
+    def _destroy_llm(self, model: ov_genai.LLMPipeline) -> None:
+        try:
+            del model
+            gc.collect()
+            logger.info("[LLM] Pipeline destroyed, memory reclaimed")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[LLM] Failed to fully destroy pipeline: %s", exc)
+
+    def close(self) -> None:
+        with self._llm_lock:
+            if getattr(self, "_llm", None) is not None:
+                self._destroy_llm(self._llm)
+                self._llm = None
+
     def ingest_text(self, text: str, source: str = "api", metadata: dict | None = None) -> int:
+        logger.info("[INGEST] Starting | source=%s | input_chars=%d", source, len(text))
+        t0 = time.monotonic()
+
         chunks = self.chunker.chunk_text(text)
+        t_chunk = time.monotonic()
+        logger.info(
+            "[INGEST] Chunking done | chunks=%d | elapsed=%.1fs",
+            len(chunks), t_chunk - t0,
+        )
+
         if not chunks:
+            logger.warning("[INGEST] No chunks produced — ingestion aborted")
             return 0
 
         docs = [
@@ -112,7 +201,14 @@ class RagPipeline:
             )
             for chunk in chunks
         ]
+
+        logger.info("[INGEST] Embedding + upserting %d docs into vectorstore...", len(docs))
         self.vectorstore.add_documents(docs)
+        t_done = time.monotonic()
+        logger.info(
+            "[INGEST] Done | docs_added=%d | embed+upsert=%.1fs | total=%.1fs",
+            len(docs), t_done - t_chunk, t_done - t0,
+        )
         return len(docs)
 
     def clear_context(self) -> None:
@@ -262,69 +358,44 @@ class RagPipeline:
         return "\n\n".join(parts)
 
     def _generate_text(self, prompt: str, max_tokens: int | None = None, temperature: float | None = None) -> str:
-        llm_cfg = config.models.llm
-        temp = temperature if temperature is not None else float(getattr(llm_cfg, "temperature", 0.0))
-        
-        # Tokenize input
-        inputs = self._tokenizer(prompt, return_tensors="pt").to(self._device)
-        
-        # Generate kwargs — no max_new_tokens cap; model stops at its own EOS
+        temp = temperature if temperature is not None else self._temperature
         gen_kwargs: dict = dict(
             temperature=max(temp, 1e-7),
             do_sample=temp > 0.0,
-            top_p=0.9 if temp > 0.0 else 1.0,
-            pad_token_id=self._tokenizer.eos_token_id,
         )
         if max_tokens is not None:
             gen_kwargs["max_new_tokens"] = max_tokens
-        
-        # Generate
-        with torch.no_grad():
-            outputs = self._model.generate(**inputs, **gen_kwargs)
-        
-        # Decode
-        generated_text = self._tokenizer.decode(outputs[0], skip_special_tokens=True)
-        
-        # Extract only the new part (remove the input prompt)
-        if prompt in generated_text:
-            answer = generated_text.split(prompt, 1)[1]
-        else:
-            answer = generated_text[len(self._tokenizer.decode(inputs["input_ids"][0], skip_special_tokens=True)):]
-        
-        return answer
+
+        with self._llm_lock:
+            result = self._llm.generate(prompt, **gen_kwargs)
+        return str(result)
 
     def _stream_generate(self, prompt: str, max_tokens: int | None = None, temperature: float | None = None) -> Generator[str, None, None]:
-        llm_cfg = config.models.llm
-        temp = temperature if temperature is not None else float(getattr(llm_cfg, "temperature", 0.0))
-        
-        # Use TextIteratorStreamer for streaming
-        streamer = TextIteratorStreamer(self._tokenizer, skip_special_tokens=True, skip_prompt=True)
-        
-        # Tokenize input
-        inputs = self._tokenizer(prompt, return_tensors="pt").to(self._device)
-        
-        # Generate kwargs — no max_new_tokens cap; model stops at its own EOS
+        temp = temperature if temperature is not None else self._temperature
         gen_kwargs: dict = dict(
             temperature=max(temp, 1e-7),
             do_sample=temp > 0.0,
-            top_p=0.9 if temp > 0.0 else 1.0,
-            streamer=streamer,
-            pad_token_id=self._tokenizer.eos_token_id,
         )
         if max_tokens is not None:
             gen_kwargs["max_new_tokens"] = max_tokens
-        
-        def _generate_thread():
-            with torch.no_grad():
-                self._model.generate(**inputs, **gen_kwargs)
-        
-        # Run generation in thread
-        thread = threading.Thread(target=_generate_thread, daemon=True)
+
+        streamer = YieldingTextStreamer(self._tokenizer)
+
+        def _run_generation() -> None:
+            try:
+                with self._llm_lock:
+                    self._llm.generate(prompt, streamer=streamer, **gen_kwargs)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("[LLM] Stream generation failed: %s", exc)
+                streamer._queue.put(f"[ERROR]: {exc}")
+            finally:
+                streamer.end()
+
+        thread = threading.Thread(target=_run_generation, daemon=True)
         thread.start()
-        
-        # Stream tokens
-        for text in streamer:
-            yield text
+
+        for token in streamer:
+            yield token
 
     @staticmethod
     def _source_payload(record: RetrievalRecord) -> dict:
@@ -339,6 +410,13 @@ class RagPipeline:
 def set_shared_pipeline(pipeline: RagPipeline) -> None:
     global _SHARED_PIPELINE
     _SHARED_PIPELINE = pipeline
+
+
+def close_shared_pipeline() -> None:
+    global _SHARED_PIPELINE
+    if _SHARED_PIPELINE is not None:
+        _SHARED_PIPELINE.close()
+        _SHARED_PIPELINE = None
 
 
 def get_shared_pipeline() -> RagPipeline:
