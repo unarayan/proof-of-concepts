@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import datetime
 import json
 import logging
+import os
 import re
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Callable
 
@@ -40,6 +43,9 @@ class SemanticChunker:
         self.llm_text_generator = llm_text_generator
         self.embedding_component = embedding_component
         self.llm_tokenizer = llm_tokenizer
+        # Optional: path to save produced chunks as JSONL for manual review
+        _debug_dir = getattr(chunk_cfg, "save_chunks_debug", None)
+        self.save_chunks_debug: str | None = str(_debug_dir) if _debug_dir else None
 
     def chunk_text(self, text: str) -> list[ChunkRecord]:
         normalized = self._normalize_text(text)
@@ -70,83 +76,101 @@ class SemanticChunker:
         )
         return records
 
-    # Hard token cap for the chunking LLM call — prevents it from running forever.
-    # Chunking only needs a JSON array back, not a long essay.
-    _CHUNKING_MAX_TOKENS = 1024
+    # Marker-only output: just a JSON integer array of line-split indices.
+    # Output is ~50-100 tokens regardless of passage size — no OOM risk.
+    _MARKER_MAX_TOKENS = 256
 
     def _semantic_llm_chunks(self, text: str) -> list[str]:
+        # ── Phase 0: detect document domain & structure once per ingest ──
+        profile = self._detect_document_profile(text)
+
+        # ── Phase 1: coarse token-window splitting ──
         if self.llm_tokenizer is not None and self.llm_passage_tokens > 0:
             coarse_passages = self._split_by_tokens(
-                text,
-                self.llm_passage_tokens,
-                self.llm_passage_overlap_tokens,
+                text, self.llm_passage_tokens, self.llm_passage_overlap_tokens,
             )
         else:
             coarse_passages = self._split_by_size(text, self.llm_passage_chars)
 
-        total_passages = len(coarse_passages)
-        logger.info("[CHUNKER] semantic_llm | total_passages=%d to process", total_passages)
+        total = len(coarse_passages)
+        logger.info(
+            "[CHUNKER] semantic_llm | passages=%d | domain=%s | %s",
+            total, profile["domain"], profile["structure"],
+        )
 
         results: list[str] = []
+        debug_chunks: list[dict] = []
+
         for p_idx, passage in enumerate(coarse_passages, start=1):
             passage_chars = len(passage)
-            if len(passage) <= self.max_chunk_chars:
+
+            if passage_chars <= self.min_chunk_chars:
                 logger.info(
-                    "[CHUNKER] Passage %d/%d | chars=%d | fits in one chunk, skipping LLM",
-                    p_idx, total_passages, passage_chars,
+                    "[CHUNKER] Passage %d/%d | chars=%d | too small, keeping as-is",
+                    p_idx, total, passage_chars,
                 )
                 results.append(passage)
                 continue
 
+            # ── Phase 2: number the lines, ask LLM for split markers only ──
+            lines, numbered = self._number_lines(passage)
             logger.info(
-                "[CHUNKER] Passage %d/%d | chars=%d | sending to LLM for semantic split",
-                p_idx, total_passages, passage_chars,
+                "[CHUNKER] Passage %d/%d | chars=%d | lines=%d | requesting split markers",
+                p_idx, total, passage_chars, len(lines),
             )
-            t_passage = time.monotonic()
+            logger.info("[CHUNKER] Passage %d/%d | preview: %r", p_idx, total, passage[:200])
 
-            prompt = (
-                "You are preparing chunks for a retail knowledge-base RAG system.\n"
-                "Split the passage into semantically coherent chunks.\n"
-                "Rules:\n"
-                "- Keep the original wording exactly.\n"
-                "- Split only on natural sentence boundaries.\n"
-                f"- Each chunk should be roughly {self.min_chunk_chars}-{self.max_chunk_chars} characters.\n"
-                "- Return ONLY a JSON array of strings, nothing else.\n\n"
-                f"PASSAGE:\n{passage}"
-            )
+            prompt = self._build_marker_prompt(numbered, profile, len(lines))
+            t0 = time.monotonic()
+
             try:
-                # Always cap chunking generation — we only need a JSON array back
-                raw = self.llm_text_generator(
-                    prompt,
-                    self._CHUNKING_MAX_TOKENS,
-                    0.0,
+                raw = self.llm_text_generator(prompt, self._MARKER_MAX_TOKENS, 0.0)
+                elapsed = time.monotonic() - t0
+                logger.info(
+                    "[CHUNKER] Passage %d/%d | LLM markers (%.1fs, %d chars): %r",
+                    p_idx, total, elapsed, len(raw), raw[:400],
                 )
-                parsed = self._parse_llm_chunk_output(raw)
-                elapsed_p = time.monotonic() - t_passage
-                if parsed:
+
+                markers = self._parse_line_markers(raw, len(lines))
+                if markers:
+                    chunks = self._split_by_line_markers(lines, markers)
                     logger.info(
-                        "[CHUNKER] Passage %d/%d | LLM produced %d sub-chunks | %.1fs",
-                        p_idx, total_passages, len(parsed), elapsed_p,
+                        "[CHUNKER] Passage %d/%d | marker split → %d chunks | starts=%s",
+                        p_idx, total, len(chunks), markers,
                     )
-                    results.extend(parsed)
+                    for ci, c in enumerate(chunks, start=1):
+                        logger.info(
+                            "[CHUNKER] Passage %d/%d | chunk %d/%d | chars=%d | preview: %r",
+                            p_idx, total, ci, len(chunks), len(c), c[:120],
+                        )
+                        debug_chunks.append({
+                            "passage_idx": p_idx, "chunk_idx": ci,
+                            "chars": len(c), "text": c,
+                        })
+                    results.extend(chunks)
                     continue
+
                 logger.warning(
-                    "[CHUNKER] Passage %d/%d | LLM output unparseable after %.1fs, using embedding fallback",
-                    p_idx, total_passages, elapsed_p,
+                    "[CHUNKER] Passage %d/%d | no valid markers parsed (%.1fs) → embedding fallback",
+                    p_idx, total, elapsed,
                 )
             except Exception as exc:  # noqa: BLE001
-                elapsed_p = time.monotonic() - t_passage
+                elapsed = time.monotonic() - t0
                 logger.warning(
-                    "[CHUNKER] Passage %d/%d | LLM error after %.1fs (%s), using embedding fallback",
-                    p_idx, total_passages, elapsed_p, exc,
+                    "[CHUNKER] Passage %d/%d | LLM error after %.1fs (%s) → embedding fallback",
+                    p_idx, total, elapsed, exc,
                 )
 
-            fb_chunks = self._semantic_embedding_chunks(passage)
+            fb = self._semantic_embedding_chunks(passage)
             logger.info(
-                "[CHUNKER] Passage %d/%d | embedding fallback produced %d chunks",
-                p_idx, total_passages, len(fb_chunks),
+                "[CHUNKER] Passage %d/%d | embedding fallback → %d chunks",
+                p_idx, total, len(fb),
             )
-            results.extend(fb_chunks)
+            results.extend(fb)
+
+        # ── Phase 3: save chunks for manual review ──
+        if self.save_chunks_debug and debug_chunks:
+            self._save_debug_chunks(debug_chunks)
 
         return self._cleanup_chunks(results)
 
@@ -255,14 +279,120 @@ class SemanticChunker:
 
         return chunks
 
-    def _parse_llm_chunk_output(self, raw_output: str) -> list[str]:
-        match = re.search(r"\[[\s\S]*\]", raw_output)
-        if not match:
-            return []
-        parsed = json.loads(match.group(0))
-        if not isinstance(parsed, list):
-            return []
-        return [str(item).strip() for item in parsed if str(item).strip()]
+    # ──────────────────────────────────────────────────────────────────
+    # Marker-based chunking helpers
+    # ──────────────────────────────────────────────────────────────────
+
+    def _detect_document_profile(self, text: str) -> dict:
+        """One-shot LLM call on the first 2000 chars to identify domain and structure.
+        Returns a dict with 'domain', 'structure', 'split_guidance' — fully dynamic,
+        no hardcoded domain keywords in the detection logic."""
+        sample = text[:2000]
+        prompt = (
+            "Analyze this document excerpt. Return ONLY a JSON object with these exact fields:\n"
+            '  "domain": category such as "retail_store", "quick_service_restaurant", '
+            '"banking", "airline", "hospital", "e_commerce", "generic"\n'
+            '  "structure": one sentence describing how this document is organized '
+            '(sections, headings, pattern)\n'
+            '  "split_guidance": one sentence on what constitutes a natural chunk boundary '
+            'for RAG knowledge retrieval\n\n'
+            f"DOCUMENT EXCERPT:\n{sample}\n\n"
+            "Return ONLY the JSON object, nothing else."
+        )
+        try:
+            raw = self.llm_text_generator(prompt, 256, 0.0)
+            logger.info("[CHUNKER] Profile detection raw: %r", raw[:300])
+            match = re.search(r"\{[\s\S]*?\}", raw)
+            if match:
+                profile = json.loads(match.group(0))
+                if {"domain", "structure", "split_guidance"} <= set(profile.keys()):
+                    result = {k: str(profile[k]) for k in ("domain", "structure", "split_guidance")}
+                    logger.info(
+                        "[CHUNKER] Document profile: domain=%s | %s",
+                        result["domain"], result["structure"],
+                    )
+                    return result
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[CHUNKER] Profile detection failed (%s), using generic defaults", exc)
+        defaults = {
+            "domain": "generic",
+            "structure": "The document has sections with headings followed by detailed content.",
+            "split_guidance": "Split where the topic or section changes significantly.",
+        }
+        logger.info("[CHUNKER] Using generic document profile")
+        return defaults
+
+    def _build_marker_prompt(self, numbered_text: str, profile: dict, n_lines: int) -> str:
+        """Dynamic chunking prompt that adapts to the detected document domain."""
+        return (
+            f"You are chunking a {profile['domain']} document for a RAG knowledge-base.\n"
+            f"Document structure: {profile['structure']}\n"
+            f"Chunking guidance: {profile['split_guidance']}\n\n"
+            "Each line below is labeled [N]. Identify which line numbers should START a new knowledge chunk.\n\n"
+            "Rules:\n"
+            "- Always include 0 (line 0 always starts the first chunk)\n"
+            "- Split where the topic, section, or entity changes meaningfully\n"
+            f"- Target chunk size: {self.min_chunk_chars}\u2013{self.max_chunk_chars} characters of content\n"
+            "- Return ONLY a JSON integer array, nothing else. Example: [0, 12, 28, 45]\n"
+            "- Do NOT reproduce any text from the document\n\n"
+            f"NUMBERED TEXT ({n_lines} lines):\n{numbered_text}"
+        )
+
+    @staticmethod
+    def _number_lines(text: str) -> tuple[list[str], str]:
+        """Prepend [N] to each line so the LLM can reference line positions."""
+        lines = text.split("\n")
+        numbered = "\n".join(f"[{i}] {line}" for i, line in enumerate(lines))
+        return lines, numbered
+
+    @staticmethod
+    def _parse_line_markers(raw: str, n_lines: int) -> list[int]:
+        """Extract sorted integer split-line indices from LLM output."""
+        # Primary: canonical JSON array of integers
+        match = re.search(r"\[[\d,\s]+\]", raw)
+        if match:
+            try:
+                parsed = json.loads(match.group(0))
+                valid = sorted({int(x) for x in parsed if 0 <= int(x) < n_lines})
+                if valid:
+                    return valid
+            except (json.JSONDecodeError, ValueError, TypeError):
+                pass
+        # Graceful fallback: collect all in-range integers from the raw text
+        nums = [int(m) for m in re.findall(r"\b(\d+)\b", raw) if 0 <= int(m) < n_lines]
+        valid = sorted(set(nums))
+        return valid if len(valid) >= 2 else []
+
+    @staticmethod
+    def _split_by_line_markers(lines: list[str], start_lines: list[int]) -> list[str]:
+        """Slice the original lines at the detected split positions."""
+        if not start_lines or start_lines[0] != 0:
+            start_lines = [0] + list(start_lines)
+        start_lines = sorted(set(start_lines))
+        chunks: list[str] = []
+        for i, start in enumerate(start_lines):
+            end = start_lines[i + 1] if i + 1 < len(start_lines) else len(lines)
+            chunk = "\n".join(lines[start:end]).strip()
+            if chunk:
+                chunks.append(chunk)
+        return chunks
+
+    def _save_debug_chunks(self, chunks: list[dict]) -> None:
+        """Persist produced chunks to a JSONL file for manual inspection."""
+        save_dir = self.save_chunks_debug  # type: ignore[arg-type]
+        if not os.path.isabs(save_dir):
+            service_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            save_dir = os.path.join(service_root, save_dir.lstrip("./"))
+        os.makedirs(save_dir, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname = os.path.join(save_dir, f"chunks_{ts}_{uuid.uuid4().hex[:8]}.jsonl")
+        try:
+            with open(fname, "w", encoding="utf-8") as fh:
+                for chunk in chunks:
+                    fh.write(json.dumps(chunk, ensure_ascii=False) + "\n")
+            logger.info("[CHUNKER] Saved %d chunks for review → %s", len(chunks), fname)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[CHUNKER] Failed to save debug chunks: %s", exc)
 
     def _cleanup_chunks(self, chunks: list[str]) -> list[str]:
         cleaned = [re.sub(r"\s+", " ", chunk).strip() for chunk in chunks if chunk and chunk.strip()]
