@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import logging
 import os
-import sys
+import shutil
 
 from huggingface_hub import snapshot_download
+from optimum.exporters.openvino import main_export
 
-from utils.cli_utils import run_cli
 from utils.config_loader import config
 
 
@@ -14,19 +14,10 @@ logger = logging.getLogger(__name__)
 _WEIGHT_FORMATS = {"fp32", "fp16", "int8", "int4"}
 _SERVICE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# Use the optimum-cli from the same Python environment that is running this
-# service, not whatever is first on PATH (which may be a broken system install).
-_OPTIMUM_CLI = os.path.join(os.path.dirname(sys.executable), "optimum-cli")
-
 
 def _slugify(model_name: str, suffix: str | None = None) -> str:
     slug = model_name.replace("/", "_")
     return f"{slug}__{suffix}" if suffix else slug
-
-
-def _is_openvino_repo(model_name: str) -> bool:
-    normalized = model_name.lower()
-    return model_name.startswith("OpenVINO/") or normalized.endswith("-ov")
 
 
 def _resolve_service_path(path: str) -> str:
@@ -36,101 +27,154 @@ def _resolve_service_path(path: str) -> str:
 
 
 def _llm_model_exists(output_dir: str) -> bool:
-    return os.path.isfile(os.path.join(output_dir, "openvino_model.xml"))
-
-
-def _embedding_model_exists(output_dir: str) -> bool:
     xml_path = os.path.join(output_dir, "openvino_model.xml")
-    return os.path.isfile(xml_path) or any(name.endswith(".xml") for name in os.listdir(output_dir)) if os.path.isdir(output_dir) else False
+    bin_path = os.path.join(output_dir, "openvino_model.bin")
+    return (
+        os.path.isfile(xml_path)
+        and os.path.getsize(xml_path) > 0
+        and os.path.isfile(bin_path)
+        and os.path.getsize(bin_path) > 0
+    )
 
 
-def _download_repo(repo_id: str, output_dir: str, hf_token: str | None = None) -> str:
+def _llm_tokenizer_exists(output_dir: str) -> bool:
+    required = (
+        "openvino_tokenizer.xml",
+        "openvino_tokenizer.bin",
+        "openvino_detokenizer.xml",
+        "openvino_detokenizer.bin",
+    )
+    return all(
+        os.path.isfile(os.path.join(output_dir, name))
+        and os.path.getsize(os.path.join(output_dir, name)) > 0
+        for name in required
+    )
+
+
+def _llm_export_ready(output_dir: str) -> bool:
+    return _llm_model_exists(output_dir) and _llm_tokenizer_exists(output_dir)
+
+
+def _download_repo(repo_id: str, output_dir: str) -> str:
     os.makedirs(output_dir, exist_ok=True)
     snapshot_download(
         repo_id=repo_id,
         local_dir=output_dir,
         local_dir_use_symlinks=False,
-        token=hf_token,
     )
     return output_dir
 
 
-def _export_openvino_model(model_name: str, output_dir: str, weight_format: str) -> str:
+def _reset_output_dir(output_dir: str) -> None:
+    if os.path.isdir(output_dir):
+        shutil.rmtree(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+
+
+def _export_openvino_tokenizer(model_name: str, output_dir: str) -> None:
+    try:
+        from openvino import save_model
+        from openvino_tokenizers import convert_tokenizer
+        from transformers import AutoTokenizer
+    except ImportError as exc:
+        raise RuntimeError(
+            "Tokenizer export dependencies are not available. Install OpenVINO tokenizer conversion support."
+        ) from exc
+
+    logger.info("Exporting tokenizer IR for %s into %s", model_name, output_dir)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    converted = convert_tokenizer(tokenizer, with_detokenizer=True)
+    if isinstance(converted, tuple):
+        ov_tokenizer, ov_detokenizer = converted
+    else:
+        ov_tokenizer = converted
+        ov_detokenizer = None
+
+    save_model(ov_tokenizer, os.path.join(output_dir, "openvino_tokenizer.xml"))
+    if ov_detokenizer is not None:
+        save_model(ov_detokenizer, os.path.join(output_dir, "openvino_detokenizer.xml"))
+
+    if not _llm_tokenizer_exists(output_dir):
+        raise RuntimeError(
+            f"Tokenizer export failed for {model_name}: OpenVINO tokenizer IR is incomplete in {output_dir}"
+        )
+
+
+def _export_openvino_model(
+    model_name: str,
+    output_dir: str,
+    weight_format: str,
+    task: str | None = None,
+) -> str:
     if weight_format not in _WEIGHT_FORMATS:
         raise ValueError(f"Unsupported OpenVINO weight format: {weight_format}")
 
-    os.makedirs(output_dir, exist_ok=True)
-    # Match smart-classroom export pattern exactly — no --task flag; optimum-cli
-    # auto-detects the task from the model config.
-    cmd = [
-        _OPTIMUM_CLI,
-        "export",
-        "openvino",
-        "--model",
-        model_name,
-        "--trust-remote-code",
-        output_dir,
-    ]
-    if weight_format:
-        cmd.extend(["--weight-format", weight_format])
-
+    _reset_output_dir(output_dir)
     logger.info(
-        "Exporting %s → %s (weight_format=%s) — this may take several minutes",
-        model_name, output_dir, weight_format,
+        "Exporting %s → %s via main_export (task=%s, weight_format=%s)",
+        model_name,
+        output_dir,
+        task or "text-generation-with-past",
+        weight_format,
     )
-    result = run_cli(cmd, log_fn=logger.info)
-    if result != 0:
-        raise RuntimeError(f"OpenVINO export failed for {model_name} with exit code {result}")
+    main_export(
+        model_name_or_path=model_name,
+        output=output_dir,
+        task=task or "text-generation-with-past",
+        trust_remote_code=True,
+        weight_format=weight_format,
+    )
+    if not _llm_model_exists(output_dir):
+        raise RuntimeError(
+            f"OpenVINO export failed for {model_name}: main_export did not produce a valid IR in {output_dir}"
+        )
+    _export_openvino_tokenizer(model_name, output_dir)
     return output_dir
 
 
 def get_llm_model_path() -> str:
     llm_cfg = config.models.llm
-    explicit = getattr(llm_cfg, "model_path", None)
-    if explicit:
-        return _resolve_service_path(explicit)
-
-    hf_id = llm_cfg.hf_id
-    suffix = None if _is_openvino_repo(hf_id) else getattr(llm_cfg, "weight_format", "int8")
-    return os.path.join(_resolve_service_path(llm_cfg.models_base_path), _slugify(hf_id, suffix))
+    return os.path.join(
+        _resolve_service_path(llm_cfg.models_base_path),
+        _slugify(llm_cfg.hf_id, getattr(llm_cfg, "weight_format", "int8")),
+    )
 
 
 def get_embedding_model_path() -> str:
     emb_cfg = config.models.embedding
-    provider = getattr(emb_cfg, "provider", "sentence_transformers").strip().lower()
-    suffix = getattr(emb_cfg, "weight_format", None) if provider == "openvino" else None
-    return os.path.join(_resolve_service_path(emb_cfg.models_base_path), provider, _slugify(emb_cfg.hf_id, suffix))
+    return os.path.join(
+        _resolve_service_path(emb_cfg.models_base_path),
+        "sentence_transformers",
+        _slugify(emb_cfg.hf_id),
+    )
 
 
 def ensure_llm_model(force: bool = False) -> str:
     llm_cfg = config.models.llm
     output_dir = get_llm_model_path()
     hf_id = llm_cfg.hf_id
-    hf_token = getattr(llm_cfg, "hf_token", None)
 
-    if _is_openvino_repo(hf_id):
-        # Pre-exported OpenVINO repo — just download
-        if not force and _llm_model_exists(output_dir):
-            logger.info("Using cached OpenVINO LLM at %s", output_dir)
-            return output_dir
-        logger.info("Downloading OpenVINO LLM %s to %s", hf_id, output_dir)
-        _download_repo(hf_id, output_dir, hf_token=hf_token)
-    else:
-        # Standard HF model — export to OpenVINO IR via optimum-cli
-        if not force and _llm_model_exists(output_dir):
-            logger.info("Using cached OpenVINO LLM export at %s", output_dir)
-            return output_dir
-        weight_format = getattr(llm_cfg, "weight_format", "int8")
-        logger.info(
-            "Exporting %s → OpenVINO IR at %s (weight_format=%s). "
-            "This takes a few minutes on first run.",
-            hf_id, output_dir, weight_format,
-        )
-        _export_openvino_model(hf_id, output_dir, weight_format)
+    if not force and _llm_export_ready(output_dir):
+        logger.info("Using cached OpenVINO LLM export at %s", output_dir)
+        return output_dir
 
-    if not _llm_model_exists(output_dir):
+    if not force and _llm_model_exists(output_dir) and not _llm_tokenizer_exists(output_dir):
+        logger.info("Repairing missing tokenizer IR for cached OpenVINO LLM export at %s", output_dir)
+        _export_openvino_tokenizer(hf_id, output_dir)
+        logger.info("LLM ready at %s", output_dir)
+        return output_dir
+
+    weight_format = getattr(llm_cfg, "weight_format", "int8")
+    logger.info(
+        "Exporting %s → OpenVINO IR at %s (weight_format=%s). "
+        "This takes a few minutes on first run.",
+        hf_id, output_dir, weight_format,
+    )
+    _export_openvino_model(hf_id, output_dir, weight_format)
+
+    if not _llm_export_ready(output_dir):
         raise RuntimeError(
-            f"LLM model export completed but openvino_model.xml is missing from {output_dir}"
+            f"LLM model export completed but required OpenVINO artifacts are missing from {output_dir}"
         )
     logger.info("LLM ready at %s", output_dir)
     return output_dir
@@ -138,30 +182,14 @@ def ensure_llm_model(force: bool = False) -> str:
 
 def ensure_embedding_model(force: bool = False) -> str:
     emb_cfg = config.models.embedding
-    provider = getattr(emb_cfg, "provider", "sentence_transformers").strip().lower()
     output_dir = get_embedding_model_path()
     if not force and os.path.isdir(output_dir) and any(os.scandir(output_dir)):
         logger.info("Using cached embedding model at %s", output_dir)
         return output_dir
 
-    if provider == "sentence_transformers":
-        if getattr(emb_cfg, "use_local_cache", True):
-            logger.info("Downloading sentence-transformers embedding model %s to %s", emb_cfg.hf_id, output_dir)
-            _download_repo(emb_cfg.hf_id, output_dir)
-        return output_dir
-
-    if provider == "openvino":
-        if _is_openvino_repo(emb_cfg.hf_id):
-            logger.info("Downloading OpenVINO embedding model %s to %s", emb_cfg.hf_id, output_dir)
-            _download_repo(emb_cfg.hf_id, output_dir)
-        else:
-            _export_openvino_model(emb_cfg.hf_id, output_dir, getattr(emb_cfg, "weight_format", "fp16"), "feature-extraction")
-
-        if not _embedding_model_exists(output_dir):
-            raise RuntimeError(f"Embedding model was prepared but no XML model file was found in {output_dir}")
-        return output_dir
-
-    raise ValueError(f"Unsupported embedding provider: {provider}")
+    logger.info("Downloading sentence-transformers embedding model %s to %s", emb_cfg.hf_id, output_dir)
+    _download_repo(emb_cfg.hf_id, output_dir)
+    return output_dir
 
 
 def ensure_model(force: bool = False) -> None:
@@ -172,11 +200,6 @@ def ensure_model(force: bool = False) -> None:
 def resolve_embedding_model_source() -> str:
     emb_cfg = config.models.embedding
     output_dir = get_embedding_model_path()
-    provider = getattr(emb_cfg, "provider", "sentence_transformers").strip().lower()
-    if provider == "sentence_transformers":
-        if os.path.isdir(output_dir) and any(os.scandir(output_dir)):
-            return output_dir
-        return emb_cfg.hf_id
-    if provider == "openvino" and _embedding_model_exists(output_dir):
+    if os.path.isdir(output_dir) and any(os.scandir(output_dir)):
         return output_dir
     return emb_cfg.hf_id

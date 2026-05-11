@@ -32,7 +32,6 @@ class SemanticChunker:
         llm_tokenizer=None,
     ) -> None:
         chunk_cfg = config.chunking
-        self.strategy = getattr(chunk_cfg, "strategy", "semantic_embedding")
         self.max_chunk_chars = int(getattr(chunk_cfg, "max_chunk_chars", 1200))
         self.min_chunk_chars = int(getattr(chunk_cfg, "min_chunk_chars", 180))
         self.overlap_chars = int(getattr(chunk_cfg, "overlap_chars", 120))
@@ -54,19 +53,15 @@ class SemanticChunker:
 
         t0 = time.monotonic()
         logger.info(
-            "[CHUNKER] Starting chunking | strategy=%s | input_chars=%d",
-            self.strategy,
+            "[CHUNKER] Starting chunking | strategy=semantic_llm | input_chars=%d",
             len(normalized),
         )
 
-        if self.strategy == "semantic_llm":
-            chunks = self._semantic_llm_chunks(normalized)
-        elif self.strategy == "semantic_embedding":
-            chunks = self._semantic_embedding_chunks(normalized)
-        else:
-            chunks = self._recursive_chunks(normalized)
+        chunks = self._semantic_llm_chunks(normalized)
 
         chunks = self._apply_overlap(chunks)
+        if self.save_chunks_debug and chunks:
+            self._save_debug_chunks(chunks)
         records = [ChunkRecord(text=chunk, index=index) for index, chunk in enumerate(chunks)]
         elapsed = time.monotonic() - t0
         logger.info(
@@ -99,7 +94,6 @@ class SemanticChunker:
         )
 
         results: list[str] = []
-        debug_chunks: list[dict] = []
 
         for p_idx, passage in enumerate(coarse_passages, start=1):
             passage_chars = len(passage)
@@ -143,10 +137,6 @@ class SemanticChunker:
                             "[CHUNKER] Passage %d/%d | chunk %d/%d | chars=%d | preview: %r",
                             p_idx, total, ci, len(chunks), len(c), c[:120],
                         )
-                        debug_chunks.append({
-                            "passage_idx": p_idx, "chunk_idx": ci,
-                            "chars": len(c), "text": c,
-                        })
                     results.extend(chunks)
                     continue
 
@@ -167,10 +157,6 @@ class SemanticChunker:
                 p_idx, total, len(fb),
             )
             results.extend(fb)
-
-        # ── Phase 3: save chunks for manual review ──
-        if self.save_chunks_debug and debug_chunks:
-            self._save_debug_chunks(debug_chunks)
 
         return self._cleanup_chunks(results)
 
@@ -203,10 +189,6 @@ class SemanticChunker:
         final_chunk = " ".join(current_sentences).strip()
         if final_chunk:
             chunks.append(final_chunk)
-        return self._cleanup_chunks(chunks)
-
-    def _recursive_chunks(self, text: str) -> list[str]:
-        chunks = self._split_by_size(text, self.max_chunk_chars)
         return self._cleanup_chunks(chunks)
 
     def _apply_overlap(self, chunks: list[str]) -> list[str]:
@@ -377,8 +359,8 @@ class SemanticChunker:
                 chunks.append(chunk)
         return chunks
 
-    def _save_debug_chunks(self, chunks: list[dict]) -> None:
-        """Persist produced chunks to a JSONL file for manual inspection."""
+    def _save_debug_chunks(self, chunks: list[str]) -> None:
+        """Persist the final chunks that will be embedded for manual inspection."""
         save_dir = self.save_chunks_debug  # type: ignore[arg-type]
         if not os.path.isabs(save_dir):
             service_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -388,8 +370,14 @@ class SemanticChunker:
         fname = os.path.join(save_dir, f"chunks_{ts}_{uuid.uuid4().hex[:8]}.jsonl")
         try:
             with open(fname, "w", encoding="utf-8") as fh:
-                for chunk in chunks:
-                    fh.write(json.dumps(chunk, ensure_ascii=False) + "\n")
+                for index, chunk in enumerate(chunks):
+                    fh.write(
+                        json.dumps(
+                            {"chunk_index": index, "chars": len(chunk), "text": chunk},
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
             logger.info("[CHUNKER] Saved %d chunks for review → %s", len(chunks), fname)
         except Exception as exc:  # noqa: BLE001
             logger.warning("[CHUNKER] Failed to save debug chunks: %s", exc)

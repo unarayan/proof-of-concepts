@@ -23,6 +23,7 @@ from utils.ensure_model import ensure_llm_model, get_llm_model_path
 logger = logging.getLogger(__name__)
 
 _SHARED_PIPELINE: "RagPipeline | None" = None
+_SHARED_PIPELINE_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -131,9 +132,7 @@ class RagPipeline:
         self._device = str(getattr(llm_cfg, "device", "CPU")).upper()
         self._temperature = float(getattr(llm_cfg, "temperature", 0.0))
 
-        # Tokenizer is loaded once at startup for the streamer decoder.
-        # The ov_genai.LLMPipeline itself is loaded per-call and destroyed after
-        # each use to free GPU memory (mirrors smart-classroom pattern).
+        # Tokenizer and pipeline are loaded once at startup and shared behind a lock.
         logger.info(
             "Loading HF tokenizer for %s (model path: %s, device: %s)",
             llm_cfg.hf_id, self._model_path, self._device,
@@ -145,17 +144,12 @@ class RagPipeline:
         self._llm_lock = threading.RLock()
         self._llm = self._load_llm()
 
-        # Build the chunker — passes _generate_text so semantic LLM chunking also
-        # uses the OpenVINO GenAI path.
         self.chunker = SemanticChunker(
             self.embedding_component,
             self._generate_text,
             llm_tokenizer=self._tokenizer,
         )
 
-    # ------------------------------------------------------------------
-    # Internal: load / destroy LLM pipeline per call (GPU memory safety)
-    # ------------------------------------------------------------------
     def _load_llm(self) -> ov_genai.LLMPipeline:
         logger.info("[LLM] Loading ov_genai.LLMPipeline from %s on %s", self._model_path, self._device)
         return ov_genai.LLMPipeline(self._model_path, self._device)
@@ -255,7 +249,7 @@ class RagPipeline:
         answer = self.generate_from_prompt(prompt, max_tokens=max_tokens, temperature=temperature)
         return {
             "answer": answer.strip(),
-            "sources": [self._source_payload(record) for record in sources],
+            "sources": self.source_payloads(sources),
         }
 
     def stream_answer(
@@ -357,27 +351,25 @@ class RagPipeline:
             total_chars += len(block)
         return "\n\n".join(parts)
 
-    def _generate_text(self, prompt: str, max_tokens: int | None = None, temperature: float | None = None) -> str:
+    def _generation_kwargs(self, max_tokens: int | None, temperature: float | None) -> dict:
         temp = temperature if temperature is not None else self._temperature
-        gen_kwargs: dict = dict(
-            temperature=max(temp, 1e-7),
-            do_sample=temp > 0.0,
-        )
+        kwargs: dict = {
+            "temperature": max(temp, 1e-7),
+            "do_sample": temp > 0.0,
+        }
         if max_tokens is not None:
-            gen_kwargs["max_new_tokens"] = max_tokens
+            kwargs["max_new_tokens"] = max_tokens
+        return kwargs
+
+    def _generate_text(self, prompt: str, max_tokens: int | None = None, temperature: float | None = None) -> str:
+        gen_kwargs = self._generation_kwargs(max_tokens=max_tokens, temperature=temperature)
 
         with self._llm_lock:
             result = self._llm.generate(prompt, **gen_kwargs)
         return str(result)
 
     def _stream_generate(self, prompt: str, max_tokens: int | None = None, temperature: float | None = None) -> Generator[str, None, None]:
-        temp = temperature if temperature is not None else self._temperature
-        gen_kwargs: dict = dict(
-            temperature=max(temp, 1e-7),
-            do_sample=temp > 0.0,
-        )
-        if max_tokens is not None:
-            gen_kwargs["max_new_tokens"] = max_tokens
+        gen_kwargs = self._generation_kwargs(max_tokens=max_tokens, temperature=temperature)
 
         streamer = YieldingTextStreamer(self._tokenizer)
 
@@ -398,7 +390,7 @@ class RagPipeline:
             yield token
 
     @staticmethod
-    def _source_payload(record: RetrievalRecord) -> dict:
+    def source_payload(record: RetrievalRecord) -> dict:
         return {
             "source": record.source,
             "score": record.score,
@@ -406,21 +398,22 @@ class RagPipeline:
             "content": record.content,
         }
 
-
-def set_shared_pipeline(pipeline: RagPipeline) -> None:
-    global _SHARED_PIPELINE
-    _SHARED_PIPELINE = pipeline
-
-
+    def source_payloads(self, records: list[RetrievalRecord]) -> list[dict]:
+        return [self.source_payload(record) for record in records]
 def close_shared_pipeline() -> None:
     global _SHARED_PIPELINE
-    if _SHARED_PIPELINE is not None:
-        _SHARED_PIPELINE.close()
-        _SHARED_PIPELINE = None
+    with _SHARED_PIPELINE_LOCK:
+        if _SHARED_PIPELINE is not None:
+            _SHARED_PIPELINE.close()
+            _SHARED_PIPELINE = None
 
 
 def get_shared_pipeline() -> RagPipeline:
     global _SHARED_PIPELINE
-    if _SHARED_PIPELINE is None:
-        _SHARED_PIPELINE = RagPipeline()
-    return _SHARED_PIPELINE
+    if _SHARED_PIPELINE is not None:
+        return _SHARED_PIPELINE
+
+    with _SHARED_PIPELINE_LOCK:
+        if _SHARED_PIPELINE is None:
+            _SHARED_PIPELINE = RagPipeline()
+        return _SHARED_PIPELINE

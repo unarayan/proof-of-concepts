@@ -15,7 +15,6 @@ logger = logging.getLogger(__name__)
 class EmbeddingComponent:
     def __init__(self) -> None:
         embedding_cfg = config.models.embedding
-        provider = getattr(embedding_cfg, "provider", "sentence_transformers").strip().lower()
         source = resolve_embedding_model_source()
         normalize = bool(getattr(embedding_cfg, "normalize_embeddings", True))
         device = getattr(embedding_cfg, "device", None)
@@ -26,12 +25,8 @@ class EmbeddingComponent:
             elif normalized_device in {"cpu", "auto", ""}:
                 device = normalized_device or None
 
-        model_kwargs = {}
-        if provider == "openvino":
-            model_kwargs["backend"] = "openvino"
-
-        logger.info("Loading embedding model %s (provider=%s)", source, provider)
-        self.model = SentenceTransformer(source, **model_kwargs)
+        logger.info("Loading embedding model %s", source)
+        self.model = SentenceTransformer(source)
         if device:
             if device == "cuda" and not torch.cuda.is_available():
                 logger.warning("CUDA requested for embeddings but no NVIDIA driver/GPU was detected; falling back to CPU")

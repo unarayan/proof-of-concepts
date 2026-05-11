@@ -14,17 +14,11 @@ models:
     device: "GPU"
     weight_format: "int8"
     models_base_path: "./models/llm"
-    hf_token: null
-    model_path: null
-    use_local_cache: true
     temperature: 0.0
   embedding:
-    provider: "sentence_transformers"
     hf_id: "BAAI/bge-large-en-v1.5"
     device: "CPU"
     models_base_path: "./models/embeddings"
-    weight_format: "fp16"
-    use_local_cache: true
     normalize_embeddings: true
 
 storage:
@@ -38,7 +32,6 @@ retrieval:
   score_threshold: null
 
 chunking:
-  strategy: "semantic_llm"
   max_chunk_chars: 3200
   min_chunk_chars: 320
   overlap_chars: 320

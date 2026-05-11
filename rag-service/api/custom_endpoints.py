@@ -75,7 +75,7 @@ def query_context(request: QueryRequest) -> StreamingResponse:
             if request.include_sources and sources:
                 payload = {
                     "event": "sources",
-                    "sources": [pipeline._source_payload(source) for source in sources],
+                    "sources": pipeline.source_payloads(sources),
                     "answer": "".join(answer_tokens).strip(),
                 }
                 yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
