@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import pathlib
 import queue
 import threading
 import time
@@ -131,6 +132,21 @@ class RagPipeline:
         self._model_path = get_llm_model_path()
         self._device = str(getattr(llm_cfg, "device", "CPU")).upper()
         self._temperature = float(getattr(llm_cfg, "temperature", 0.0))
+        self._default_max_new_tokens = int(getattr(config.answering, "max_tokens", 192))
+        self._max_generations_before_reload = int(
+            getattr(config.answering, "max_generations_before_reload", 25)
+        )
+        self._generations_since_reload = 0
+
+        # Plugin properties — primarily CACHE_DIR so periodic reloads skip
+        # kernel compilation on the GPU and complete in seconds.
+        self._plugin_config: dict[str, str] = {}
+        cache_dir = getattr(llm_cfg, "cache_dir", None)
+        if cache_dir:
+            cache_path = pathlib.Path(cache_dir).expanduser().resolve()
+            cache_path.mkdir(parents=True, exist_ok=True)
+            self._plugin_config["CACHE_DIR"] = str(cache_path)
+            logger.info("[LLM] OpenVINO model cache enabled at %s", cache_path)
 
         # Tokenizer and pipeline are loaded once at startup and shared behind a lock.
         logger.info(
@@ -151,7 +167,12 @@ class RagPipeline:
         )
 
     def _load_llm(self) -> ov_genai.LLMPipeline:
-        logger.info("[LLM] Loading ov_genai.LLMPipeline from %s on %s", self._model_path, self._device)
+        logger.info(
+            "[LLM] Loading ov_genai.LLMPipeline from %s on %s (plugin_config=%s)",
+            self._model_path, self._device, self._plugin_config or "{}",
+        )
+        if self._plugin_config:
+            return ov_genai.LLMPipeline(self._model_path, self._device, **self._plugin_config)
         return ov_genai.LLMPipeline(self._model_path, self._device)
 
     def _destroy_llm(self, model: ov_genai.LLMPipeline) -> None:
@@ -167,6 +188,49 @@ class RagPipeline:
             if getattr(self, "_llm", None) is not None:
                 self._destroy_llm(self._llm)
                 self._llm = None
+
+    @staticmethod
+    def _is_resource_exhaustion(exc: Exception) -> bool:
+        message = str(exc).upper()
+        return any(
+            marker in message
+            for marker in (
+                "CL_OUT_OF_RESOURCES",
+                "OUT OF MEMORY",
+                "NOT ENOUGH MEMORY",
+                "ALLOCATE",
+            )
+        )
+
+    def _reload_llm_locked(self) -> None:
+        if getattr(self, "_llm", None) is not None:
+            self._destroy_llm(self._llm)
+            self._llm = None
+        self._llm = self._load_llm()
+        self._generations_since_reload = 0
+
+    def _post_generation_locked(self) -> None:
+        """Run cleanup after a successful generation while holding _llm_lock.
+
+        Increments the generation counter, runs gc.collect to release Python
+        references to intermediate tensors, and recycles the LLMPipeline once
+        the configured threshold is reached to avoid GPU memory fragmentation
+        / KV cache buildup that eventually triggers CL_OUT_OF_RESOURCES.
+        """
+        self._generations_since_reload += 1
+        try:
+            gc.collect()
+        except Exception:  # noqa: BLE001
+            pass
+        if (
+            self._max_generations_before_reload > 0
+            and self._generations_since_reload >= self._max_generations_before_reload
+        ):
+            logger.info(
+                "[LLM] Reached %d generations since last reload; recycling pipeline proactively",
+                self._generations_since_reload,
+            )
+            self._reload_llm_locked()
 
     def ingest_text(self, text: str, source: str = "api", metadata: dict | None = None) -> int:
         logger.info("[INGEST] Starting | source=%s | input_chars=%d", source, len(text))
@@ -226,7 +290,7 @@ class RagPipeline:
             "collection_name": self.collection_name,
             "persist_directory": self.persist_directory,
             "document_count": count,
-            "chunking_strategy": config.chunking.strategy,
+            "chunking_strategy": "semantic_llm",
             "llm_model": config.models.llm.hf_id,
             "embedding_model": config.models.embedding.hf_id,
         }
@@ -357,15 +421,22 @@ class RagPipeline:
             "temperature": max(temp, 1e-7),
             "do_sample": temp > 0.0,
         }
-        if max_tokens is not None:
-            kwargs["max_new_tokens"] = max_tokens
+        kwargs["max_new_tokens"] = max_tokens if max_tokens is not None else self._default_max_new_tokens
         return kwargs
 
     def _generate_text(self, prompt: str, max_tokens: int | None = None, temperature: float | None = None) -> str:
         gen_kwargs = self._generation_kwargs(max_tokens=max_tokens, temperature=temperature)
 
         with self._llm_lock:
-            result = self._llm.generate(prompt, **gen_kwargs)
+            try:
+                result = self._llm.generate(prompt, **gen_kwargs)
+            except Exception as exc:  # noqa: BLE001
+                if not self._is_resource_exhaustion(exc):
+                    raise
+                logger.warning("[LLM] Generation hit resource exhaustion; recycling pipeline and retrying once: %s", exc)
+                self._reload_llm_locked()
+                result = self._llm.generate(prompt, **gen_kwargs)
+            self._post_generation_locked()
         return str(result)
 
     def _stream_generate(self, prompt: str, max_tokens: int | None = None, temperature: float | None = None) -> Generator[str, None, None]:
@@ -376,7 +447,15 @@ class RagPipeline:
         def _run_generation() -> None:
             try:
                 with self._llm_lock:
-                    self._llm.generate(prompt, streamer=streamer, **gen_kwargs)
+                    try:
+                        self._llm.generate(prompt, streamer=streamer, **gen_kwargs)
+                    except Exception as exc:  # noqa: BLE001
+                        if not self._is_resource_exhaustion(exc):
+                            raise
+                        logger.warning("[LLM] Stream generation hit resource exhaustion; recycling pipeline and retrying once: %s", exc)
+                        self._reload_llm_locked()
+                        self._llm.generate(prompt, streamer=streamer, **gen_kwargs)
+                    self._post_generation_locked()
             except Exception as exc:  # noqa: BLE001
                 logger.error("[LLM] Stream generation failed: %s", exc)
                 streamer._queue.put(f"[ERROR]: {exc}")
