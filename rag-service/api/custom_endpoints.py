@@ -12,6 +12,8 @@ from pipeline import get_shared_pipeline
 
 router = APIRouter()
 
+_MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB
+
 
 @router.get("/health")
 def health() -> dict[str, str]:
@@ -33,6 +35,11 @@ async def ingest_context_file(file: UploadFile = File(...)) -> IngestResponse:
         raise HTTPException(status_code=415, detail="Only .txt and .md files are supported")
 
     raw = await file.read()
+    if len(raw) > _MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large. Maximum allowed size is {_MAX_UPLOAD_BYTES // (1024 * 1024)} MB",
+        )
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:

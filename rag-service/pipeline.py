@@ -39,6 +39,7 @@ class YieldingTextStreamer(ov_genai.StreamerBase):
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._token_cache: list[int] = []
         self._print_len = 0
+        self._exc: Exception | None = None
 
     def put(self, token_id: int) -> bool:
         self._token_cache.append(token_id)
@@ -458,7 +459,7 @@ class RagPipeline:
                     self._post_generation_locked()
             except Exception as exc:  # noqa: BLE001
                 logger.error("[LLM] Stream generation failed: %s", exc)
-                streamer._queue.put(f"[ERROR]: {exc}")
+                streamer._exc = exc
             finally:
                 streamer.end()
 
@@ -467,6 +468,9 @@ class RagPipeline:
 
         for token in streamer:
             yield token
+
+        if streamer._exc is not None:
+            raise streamer._exc
 
     @staticmethod
     def source_payload(record: RetrievalRecord) -> dict:
