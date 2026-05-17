@@ -48,11 +48,35 @@ DEFAULT_QUERY_URL = "http://127.0.0.1:8020/api/v1/query"
 DEFAULT_CHAT_URL = "http://127.0.0.1:8020/v1/chat/completions"
 HEALTH_URL = "http://127.0.0.1:8020/health"
 
+
+def _enable_line_buffering() -> None:
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is not None and hasattr(stream, "reconfigure"):
+            stream.reconfigure(line_buffering=True)
+
+
+def _preview_text(text: str, limit: int = 160) -> str:
+    compact = " ".join(text.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 4] + " ..."
+
+
+_enable_line_buffering()
+
 NO_PROXY = {"http": "", "https": ""}
 
 CHROMA_PATH = BASE_DIR / "storage" / "vector_db"
 CHROMA_COLLECTION = "smart-kiosk-assistant-bge-large"
 EMBED_MODEL_NAME = "BAAI/bge-large-en-v1.5"
+EMBED_MODEL_PATH = (
+    BASE_DIR
+    / "models"
+    / "embeddings"
+    / "sentence_transformers"
+    / "BAAI_bge-large-en-v1.5"
+)
 
 SERVICE_START_CMD = (
     "source /home/intel/udit-ws/kiosk/new_audio_analyzer/.venv-1/bin/activate && "
@@ -62,6 +86,12 @@ SERVICE_START_CMD = (
 
 # Lazy-initialised local retriever (embedding model + chromadb collection)
 _local_retriever: dict | None = None
+
+
+def _get_embed_model_source() -> str:
+    if EMBED_MODEL_PATH.exists():
+        return str(EMBED_MODEL_PATH)
+    return EMBED_MODEL_NAME
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -102,15 +132,16 @@ def _init_local_retriever() -> bool:
     try:
         import chromadb
         from sentence_transformers import SentenceTransformer
-        print(f"[LocalRetriever] Loading {EMBED_MODEL_NAME} + chromadb…")
-        embed_model = SentenceTransformer(EMBED_MODEL_NAME)
+        embed_model_source = _get_embed_model_source()
+        print(f"[LocalRetriever] Loading {embed_model_source} + chromadb…", flush=True)
+        embed_model = SentenceTransformer(embed_model_source)
         client = chromadb.PersistentClient(path=str(CHROMA_PATH))
         coll = client.get_collection(CHROMA_COLLECTION)
         _local_retriever = {"embed": embed_model, "coll": coll}
-        print(f"[LocalRetriever] Ready. Collection has {coll.count()} docs.")
+        print(f"[LocalRetriever] Ready. Collection has {coll.count()} docs.", flush=True)
         return True
     except Exception as exc:
-        print(f"[LocalRetriever] Init failed: {exc}")
+        print(f"[LocalRetriever] Init failed: {exc}", flush=True)
         return False
 
 
@@ -235,15 +266,16 @@ def compute_bert_scores(
     try:
         import numpy as np
         from sentence_transformers import SentenceTransformer
-        print(f"\n[SemanticSim] Encoding {len(cands)} pairs with {EMBED_MODEL_NAME}…")
-        model = SentenceTransformer(EMBED_MODEL_NAME)
+        embed_model_source = _get_embed_model_source()
+        print(f"\n[SemanticSim] Encoding {len(cands)} pairs with {embed_model_source}…", flush=True)
+        model = SentenceTransformer(embed_model_source)
         cand_embs = model.encode(list(cands), batch_size=batch_size, normalize_embeddings=True, show_progress_bar=True)
         ref_embs  = model.encode(list(refs),  batch_size=batch_size, normalize_embeddings=True, show_progress_bar=True)
         sims = (cand_embs * ref_embs).sum(axis=1).tolist()  # cosine sim (already L2-normalised)
         mean_sim = float(sum(sims) / len(sims))
-        print(f"[SemanticSim] Done. Mean cosine similarity={mean_sim:.4f}")
+        print(f"[SemanticSim] Done. Mean cosine similarity={mean_sim:.4f}", flush=True)
         return {
-            "model": EMBED_MODEL_NAME,
+            "model": embed_model_source,
             "metric": "cosine_similarity",
             "precision": mean_sim,
             "recall": mean_sim,
@@ -251,7 +283,7 @@ def compute_bert_scores(
             "n": len(cands),
         }
     except Exception as exc:
-        print(f"[SemanticSim] Failed: {exc}. Trying bert_score fallback…")
+        print(f"[SemanticSim] Failed: {exc}. Trying bert_score fallback…", flush=True)
 
     # ── Fallback: bert_score with explicit num_layers (bypasses registry) ──
     try:
@@ -326,7 +358,7 @@ def run_evaluation(args: argparse.Namespace) -> int:
         print(f"Resuming from checkpoint: {len(done_ids)} already done.")
 
     pending = [it for it in items if it["id"] not in done_ids]
-    print(f"Evaluating {len(pending)} / {len(items)} questions against {args.chat_url}")
+    print(f"Evaluating {len(pending)} / {len(items)} questions against {args.chat_url}", flush=True)
 
     # Initialise local retriever (chromadb + embedding model) once before the loop
     if not _init_local_retriever():
@@ -361,18 +393,18 @@ def run_evaluation(args: argparse.Namespace) -> int:
                 break
             except requests.exceptions.ConnectionError as exc:
                 elapsed_chat = time.monotonic() - t0
-                print(f"  [{i}/{len(pending)}] Q{qid} ConnectionError (attempt {_attempt + 1}/3)")
+                print(f"  [{i}/{len(pending)}] Q{qid} ConnectionError (attempt {_attempt + 1}/3)", flush=True)
                 if _attempt < 2 and args.auto_restart:
-                    print("  [restart] Service appears down — restarting…")
+                    print("  [restart] Service appears down — restarting…", flush=True)
                     if restart_service():
                         continue
                 error = str(exc)
-                print(f"  [{i}/{len(pending)}] Q{qid} ERROR (chat): {exc}")
+                print(f"  [{i}/{len(pending)}] Q{qid} ERROR (chat): {exc}", flush=True)
                 break
             except Exception as exc:  # noqa: BLE001
                 elapsed_chat = time.monotonic() - t0
                 error = str(exc)
-                print(f"  [{i}/{len(pending)}] Q{qid} ERROR (chat): {exc}")
+                print(f"  [{i}/{len(pending)}] Q{qid} ERROR (chat): {exc}", flush=True)
                 break
 
         # ── retrieval for MRR via local chromadb (no LLM) ─────────────────
@@ -400,8 +432,11 @@ def run_evaluation(args: argparse.Namespace) -> int:
         status = f"RR={rr:.2f}" if reference else "no-ref"
         print(
             f"  [{i}/{len(pending)}] Q{qid} [{nature}] {elapsed_chat:.1f}s "
-            f"| {status} | {question[:70]}"
+            f"| {status} | {question[:70]}",
+            flush=True,
         )
+        if generated:
+            print(f"      -> {_preview_text(generated)}", flush=True)
 
     cp_fh.close()
 

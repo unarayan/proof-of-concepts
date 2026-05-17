@@ -197,8 +197,10 @@ class SemanticChunker:
 
         with_overlap: list[str] = [chunks[0]]
         for index in range(1, len(chunks)):
-            prefix = chunks[index - 1][-self.overlap_chars :].strip()
             current = chunks[index]
+            available_prefix_chars = max(self.max_chunk_chars - len(current) - 1, 0)
+            prefix_chars = min(self.overlap_chars, available_prefix_chars)
+            prefix = chunks[index - 1][-prefix_chars:].strip() if prefix_chars > 0 else ""
             combined = f"{prefix}\n{current}" if prefix else current
             with_overlap.append(combined.strip())
         return with_overlap
@@ -221,20 +223,61 @@ class SemanticChunker:
                 current = paragraph
                 continue
 
-            sentence_buffer = ""
-            for sentence in self._split_sentences(paragraph):
-                sentence_candidate = f"{sentence_buffer} {sentence}".strip() if sentence_buffer else sentence
-                if len(sentence_candidate) <= max_chars:
-                    sentence_buffer = sentence_candidate
-                    continue
-                if sentence_buffer:
-                    chunks.append(sentence_buffer)
-                sentence_buffer = sentence
-            current = sentence_buffer
+            for segment in self._split_large_block(paragraph, max_chars):
+                if len(segment) <= max_chars:
+                    chunks.append(segment)
+                else:
+                    chunks.extend(
+                        part.strip()
+                        for part in (segment[i : i + max_chars] for i in range(0, len(segment), max_chars))
+                        if part.strip()
+                    )
+            current = ""
 
         if current:
             chunks.append(current)
         return chunks
+
+    def _split_large_block(self, text: str, max_chars: int) -> list[str]:
+        structured_units = [unit.strip() for unit in re.split(r"(?=(?:##+\s|###\s|-\s\*\*))", text) if unit.strip()]
+        if len(structured_units) > 1:
+            chunks: list[str] = []
+            current = ""
+            for unit in structured_units:
+                if len(unit) > max_chars:
+                    if current:
+                        chunks.append(current)
+                        current = ""
+                    chunks.extend(self._split_large_block(unit, max_chars))
+                    continue
+                candidate = f"{current} {unit}".strip() if current else unit
+                if len(candidate) <= max_chars:
+                    current = candidate
+                else:
+                    if current:
+                        chunks.append(current)
+                    current = unit
+            if current:
+                chunks.append(current)
+            return chunks
+
+        sentences = self._split_sentences(text)
+        if len(sentences) > 1:
+            chunks = []
+            current = ""
+            for sentence in sentences:
+                candidate = f"{current} {sentence}".strip() if current else sentence
+                if len(candidate) <= max_chars:
+                    current = candidate
+                    continue
+                if current:
+                    chunks.append(current)
+                current = sentence
+            if current:
+                chunks.append(current)
+            return chunks
+
+        return [text.strip()]
 
     def _split_by_tokens(self, text: str, max_tokens: int, overlap_tokens: int) -> list[str]:
         tokenizer = self.llm_tokenizer
@@ -359,6 +402,37 @@ class SemanticChunker:
                 chunks.append(chunk)
         return chunks
 
+    def _enforce_max_chunk_chars(self, chunks: list[str]) -> list[str]:
+        """Preserve semantic boundaries first, then split oversized chunks locally."""
+        bounded: list[str] = []
+        for chunk in chunks:
+            if len(chunk) <= self.max_chunk_chars:
+                bounded.append(chunk)
+                continue
+
+            lines = [line.strip() for line in chunk.split("\n") if line.strip()]
+            if len(lines) > 1:
+                current_lines: list[str] = []
+                for line in lines:
+                    candidate = "\n".join(current_lines + [line]) if current_lines else line
+                    if len(candidate) <= self.max_chunk_chars:
+                        current_lines.append(line)
+                        continue
+                    if current_lines:
+                        bounded.append("\n".join(current_lines).strip())
+                    if len(line) <= self.max_chunk_chars:
+                        current_lines = [line]
+                    else:
+                        bounded.extend(self._split_by_size(line, self.max_chunk_chars))
+                        current_lines = []
+                if current_lines:
+                    bounded.append("\n".join(current_lines).strip())
+                continue
+
+            bounded.extend(self._split_by_size(chunk, self.max_chunk_chars))
+
+        return bounded
+
     def _save_debug_chunks(self, chunks: list[str]) -> None:
         """Persist the final chunks that will be embedded for manual inspection."""
         save_dir = self.save_chunks_debug  # type: ignore[arg-type]
@@ -383,14 +457,16 @@ class SemanticChunker:
             logger.warning("[CHUNKER] Failed to save debug chunks: %s", exc)
 
     def _cleanup_chunks(self, chunks: list[str]) -> list[str]:
-        cleaned = [re.sub(r"\s+", " ", chunk).strip() for chunk in chunks if chunk and chunk.strip()]
+        cleaned = [chunk.strip() for chunk in chunks if chunk and chunk.strip()]
         merged: list[str] = []
         for chunk in cleaned:
             if merged and len(chunk) < self.min_chunk_chars:
                 merged[-1] = f"{merged[-1]} {chunk}".strip()
             else:
                 merged.append(chunk)
-        return merged
+        if any(len(chunk) > self.max_chunk_chars for chunk in merged):
+            merged = self._enforce_max_chunk_chars(merged)
+        return [re.sub(r"\s+", " ", chunk).strip() for chunk in merged if chunk and chunk.strip()]
 
     @staticmethod
     def _split_sentences(text: str) -> list[str]:

@@ -14,18 +14,15 @@ models:
     device: "GPU"
     weight_format: "int8"
     models_base_path: "./models/llm"
-    hf_token: null
-    model_path: null
-    use_local_cache: true
-    cache_dir: "./storage/ov_cache"
     temperature: 0.0
+    # Persist compiled GPU kernels here so the periodic LLMPipeline recycle
+    # skips kernel compilation (first load is normal, subsequent reloads are
+    # ~few seconds instead of ~minute). Set to null/empty to disable.
+    cache_dir: "./storage/ov_cache"
   embedding:
-    provider: "sentence_transformers"
     hf_id: "BAAI/bge-large-en-v1.5"
     device: "CPU"
     models_base_path: "./models/embeddings"
-    weight_format: "fp16"
-    use_local_cache: true
     normalize_embeddings: true
 
 storage:
@@ -35,18 +32,18 @@ storage:
 retrieval:
   top_k: 3
   fetch_k: 6
-  max_context_chars: null
+  max_context_chars: 8000
   score_threshold: null
 
 chunking:
-  strategy: "semantic_llm"
-  max_chunk_chars: 2000
+  max_chunk_chars: 1500
   min_chunk_chars: 200
   overlap_chars: 200
   semantic_similarity_threshold: 0.72
-  llm_passage_chars: 20000
-  llm_passage_tokens: 5000
+  llm_passage_chars: 18000
+  llm_passage_tokens: 5000      # wide enough to keep a full semantic intact before LLM splits it
   llm_passage_overlap_tokens: 300
+  save_chunks_debug: "./storage/chunks_debug"  # set to null to disable
 
 answering:
   system_prompt: |
@@ -56,4 +53,7 @@ answering:
   fallback_to_general_knowledge: true
   include_source_markers: false
   max_tokens: 192
-  max_generations_before_reload: 8
+  # Proactively recycle the OpenVINO LLMPipeline after this many generate()
+  # calls to release iGPU KV/working memory and avoid CL_OUT_OF_RESOURCES.
+  # Set to 0 to disable proactive recycling (only on-error recycling will run).
+  max_generations_before_reload: 15
